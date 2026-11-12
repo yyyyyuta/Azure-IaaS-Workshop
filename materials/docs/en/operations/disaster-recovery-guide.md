@@ -1,0 +1,94 @@
+---
+title: "Disaster Recovery Guide"
+---
+
+# Disaster Recovery Guide
+
+## What You Do On This Page
+
+Review the BCDR concepts used in this workshop: Azure Backup for recovery points, Azure Site Recovery for failover orchestration, and the safety rules for test failover.
+
+| Item | Details |
+|---|---|
+| Audience | Learners who want the background behind Day 2 BCDR tasks |
+| Time | 15-25 minutes |
+| Prerequisites | Day 1 environment and Day 2 checklist context |
+| Done When | You can explain backup, restore, replication, failover, test failover, RPO, and RTO |
+
+## 1. Workshop Strategy
+
+| Capability | Workshop Use |
+|---|---|
+| Azure Backup | Create recovery points and review restore options for VMs |
+| Azure Site Recovery | Review or demo replication and test failover |
+| HA testing | Stop one VM at a time and observe Application Gateway, Load Balancer, and MongoDB behavior |
+
+For this IaaS workshop, Web and App tiers are easier to reason about because they are mostly stateless. DB tier failover requires more care because MongoDB replica set behavior and data consistency matter.
+
+| Tier | Configuration | Expected Behavior |
+|---|---|---|
+| Web | 2 VMs + Application Gateway | One VM can stop; traffic routes to the healthy VM |
+| App | 2 VMs + internal Load Balancer | One VM can stop; the API continues or recovers shortly |
+| DB | 3 VMs (Zones 1/2/3, data-bearing voting members, no arbiter) + MongoDB replica set | Any one VM can stop; the remaining two (a majority) elect a PRIMARY automatically and `w=majority` writes continue. Writes can fail for about 10-15 seconds during the election. Stopping two at once loses the majority and stops writes |
+
+## 2. Azure Backup Pattern
+
+1. Create the Backup vault `rsv-blogapp-backup` in the same region as the workload VMs.
+2. Enable Backup for selected workshop VMs.
+3. Run on-demand backup when the instructor tells you to.
+4. Confirm restore points.
+5. Review Restore VM options, and only create restored VMs when instructed.
+
+**Good Outcome:** Learners can explain what is protected, where restore points are visible, and why production restores should be validated on new resources first.
+
+## 3. Azure Site Recovery Pattern
+
+Cross-region ASR requires a vault outside the source region, so do not reuse the Backup vault. This exercise creates `rsv-blogapp-dr` in the recovery target region (`japaneast` for a `japanwest` source, or `japanwest` for a `japaneast` source). See the [official placement requirements](https://learn.microsoft.com/azure/site-recovery/azure-to-azure-tutorial-enable-replication).
+
+1. Use the target-region vault `rsv-blogapp-dr` > Site Recovery.
+2. Enable replication for representative VMs or instructor-selected tiers.
+3. Review target region and VNet/subnet mapping.
+4. Wait for initial replication or switch to instructor demo.
+5. Run test failover only into an isolated test network.
+6. Clean up test failover resources.
+
+**Good Outcome:** Learners can explain the difference between replication health, test failover, cleanup, planned failover, and unplanned failover.
+
+**Cleanup:** Test failover cleanup does not stop replication or delete the vaults. After the workshop, review replication disablement in `rsv-blogapp-dr`, deletion of unneeded backup data in `rsv-blogapp-backup`, and removal of both vaults and related resources. See [Day 2 Step 13](../learner/day-2-resiliency-checklist.md#13-review-cleanup-targets) for the procedure and retention/soft-delete cautions.
+
+## 4. Database Tier Considerations
+
+MongoDB replica sets help with node or zonal failures, but regional DR requires a plan.
+
+- If DB VMs are replicated with ASR, include **all three** (`vm-db-az1/az2/az3-prod`) in the same recovery plan group and start them before Web/App. Failing over only one node gives it 1 of 3 votes, so it cannot elect a PRIMARY.
+- If Azure Backup protects the DB tier, protect all three VMs. A restore usually starts from one member's data disk; the other members rebuild through initial sync.
+- `rs.reconfig({force: true})` after losing two or more members is a last resort that can roll back committed writes. Do not use it for normal failures.
+- Validate replica set health and primary election after failover.
+- If the workshop keeps DB regional DR as a design exercise, focus hands-on ASR on Web/App or representative VMs.
+
+## 5. RPO And RTO
+
+| Term | Meaning | Workshop Question |
+|---|---|---|
+| RPO | Maximum acceptable data loss | How much data could be lost between backups or replication points? |
+| RTO | Maximum acceptable outage duration | How long can the app be unavailable during restore or failover? |
+
+Backup-heavy recovery is simpler but often has larger RTO. Replication/failover can reduce RTO, but it needs more design and validation.
+
+## 6. Safety Checklist
+
+- Define RPO and RTO for the scenario.
+- Confirm backups complete before discussing restore.
+- Run test failover in an isolated network.
+- Clean up test failover resources.
+- Confirm all stopped VMs are running again.
+- Do not leave duplicate restored VMs unless the instructor explicitly wants them.
+- **Instructor pre-check:** Before the workshop, run `uname -r` on a representative VM and compare it against the Mobility service's [supported-kernel list](https://github.com/Azure/Azure-SiteRecovery/tree/main/MobilityAgent/AzureToAzure/SupportedKernels). Ubuntu's rolling kernel updates can outpace that list, causing Enable replication to fail with error 151141 (fix: [troubleshooting runbook §10.1](troubleshooting-runbook.md#101-error-151141-kernel-not-yet-supported-by-mobility-service)).
+
+## Related Pages
+
+- Main exercise: [Day 2: Resiliency checklist](../learner/day-2-resiliency-checklist.md)
+- Symptom-based help: [Troubleshooting runbook](troubleshooting-runbook.md)
+- Commands and names: [Quick reference](../reference/quick-reference-card.md)
+
+Back to the [learner portal](../index.md)

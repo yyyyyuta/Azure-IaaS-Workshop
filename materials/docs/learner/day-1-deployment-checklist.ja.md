@@ -1,0 +1,391 @@
+---
+title: "Day 1: Azure リソースデプロイ"
+---
+
+# Day 1: Azure リソースデプロイ
+
+## このページでやること
+
+Azure Cloud Shell Bash を使って、作業環境の準備、Bicep パラメータ作成、Azure IaaS 環境のデプロイ、MongoDB 初期化、Data Collection Rule 構成、Application Gateway FQDN 取得、フロントエンド SPA の redirect URI 更新までを進めます。
+
+| 項目 | 内容 |
+|---|---|
+| 対象者 | Day 0 の事前準備を終えた受講者 |
+| 所要時間 | 45-75 分 |
+| 前提 | Cloud Shell Bash、Entra ID アプリ登録値、VM クォータ、GitHub リポジトリのコピー |
+| 完了条件 | Bicep deployment が `Succeeded` になり、デプロイ後セットアップ、DCR 構成、Application Gateway FQDN 取得、SPA redirect URI 更新が完了していること |
+
+## 0. Cloud Shell Bash を開き、リポジトリを準備する
+
+1. Azure Portal にサインインします。
+2. 画面上部の Cloud Shell アイコンをクリックします。
+3. シェル選択で **Bash** を選びます。
+4. 初回起動時はストレージ作成を求められるため、講師の指定に従って作成します。
+
+Cloud Shell Bash で、Day 0 で作成した自分のコピー先リポジトリを clone します。すでに clone 済みの場合は `cd` だけ実行します。
+
+```bash
+cd ~
+if [ ! -d Azure-IaaS-Workshop ]; then
+  git clone https://github.com/<OWNER>/Azure-IaaS-Workshop.git
+fi
+cd ~/Azure-IaaS-Workshop
+```
+
+作業変数を設定します。Cloud Shell を再起動した場合も、この変数は再設定します。
+
+```bash
+cd ~/Azure-IaaS-Workshop
+
+LOCATION="japanwest"
+RESOURCE_GROUP="rg-blogapp-workshop"
+```
+
+複数グループで同じサブスクリプションを使う場合は、講師から割り当てられたグループ ID をリソースグループ名に含めます。
+
+| グループ | リソースグループ名 |
+|---|---|
+| A | `rg-blogapp-A-workshop` |
+| B | `rg-blogapp-B-workshop` |
+| C | `rg-blogapp-C-workshop` |
+
+**期待結果:** 自分が使うリソースグループ名を説明できます。
+
+## 1. Azure CLI の状態を確認する
+
+```bash
+az account show --query "{subscription:name, subscriptionId:id, tenantId:tenantId}" -o table
+```
+
+**チェックポイント:** Day 0 で控えた Tenant ID と一致していることを確認します。
+
+## 2. SSH 鍵を準備する
+
+Cloud Shell 内に SSH 鍵がない場合は作成します。
+
+```bash
+ssh-keygen -t rsa -b 4096 -C "workshop@azure"
+cat ~/.ssh/id_rsa.pub
+```
+
+Cloud Shell が切断された場合に備えて、秘密鍵と公開鍵を `~/clouddrive` に退避します。`~/clouddrive` は Cloud Shell の永続ストレージです。
+
+```bash
+mkdir -p ~/clouddrive/workshop-keys
+cp ~/.ssh/id_rsa ~/.ssh/id_rsa.pub ~/clouddrive/workshop-keys/
+chmod 600 ~/clouddrive/workshop-keys/id_rsa
+```
+
+**期待結果:** `ssh-rsa` で始まる公開鍵を取得できます。
+
+**チェックポイント:** `main.local.bicepparam` に貼るのは公開鍵です。秘密鍵は Cloud Shell と `~/clouddrive/workshop-keys` だけに保持し、GitHub に push しません。
+
+## 3. SSL 証明書を生成する
+
+```bash
+chmod +x scripts/generate-ssl-cert.sh
+./scripts/generate-ssl-cert.sh
+```
+
+確認します。
+
+```bash
+ls -l cert.pfx cert-base64.txt
+```
+
+**期待結果:** `cert.pfx` と `cert-base64.txt` が作成されます。
+
+**チェックポイント:** `sslCertificatePassword` は、スクリプト既定の `Workshop2024!` と一致させます。自己署名証明書のため、ブラウザ警告は想定内です。
+
+## 4. Bicep パラメータファイルを作成する
+
+```bash
+cd materials/bicep
+cp main.bicepparam main.local.bicepparam
+code main.local.bicepparam
+```
+
+![Cloud Shell の VS Code](../assets/screenshots/learners-portal/day1/vscode.png)
+*Cloud Shell の VS Code*
+
+以前作成した `main.local.bicepparam` を再利用する場合は上書きせず、`webVmSize` と `appVmSize` が `Standard_D2s_v6`、`dbVmSize` が `Standard_D4s_v6` であることを確認します。旧版をコピーしたファイルは Basv2 のままです。
+
+少なくとも次を設定します。
+
+| パラメータ | 入力する値 | 取得方法 |
+|---|---|---|
+| `sshPublicKey` | Cloud Shell で作成した公開鍵 | `cat ~/.ssh/id_rsa.pub` |
+| `adminObjectId` | 自分の Entra object ID | Day 0 で控えた値 |
+| `entraTenantId` | Tenant ID | Day 0 で控えた値 |
+| `entraClientId` | Backend API Client ID | Day 0 で控えた値 |
+| `entraFrontendClientId` | Frontend SPA Client ID | Day 0 で控えた値 |
+| `sslCertificateData` | `cert-base64.txt` の内容 | `cat ../../cert-base64.txt` |
+| `sslCertificatePassword` | PFX パスワード | 既定値 `Workshop2024!` |
+| `mongoDbAppPassword` | MongoDB アプリユーザーのパスワード | 自分で決める強い値。Step 9 の `<YOUR_MONGODB_APP_PASSWORD>` と完全一致させる。<u>**必ず下記の IMPORTANT の内容も読むこと。**</u> |
+| `mongoDbReplicaSetKey` | MongoDB レプリカセットの共有キー（keyFile） | 下記の生成コマンドの出力を 1 行で貼り付ける。再デプロイでも同じ値を使う |
+| `assignKeyVaultRoles` | `true`（既定）。**共同作成者（Contributor）ロールしかない場合のみ `false`** | Day 0 Step 3.1 で確認したロール。`false` では Key Vault のロールを割り当てません |
+| `appGatewayDnsLabel` | 一意な DNS ラベル | 例: `blogapp-team1-0106`。<u>**アルファベットの大文字や@などの特殊記号は利用しないこと。**</u>基本的には小文字、数字、ハイフンを利用する。 |
+
+`mongoDbReplicaSetKey` を初めて設定する場合は、次のコマンドをコピーして Cloud Shell またはローカルのターミナルで実行します。
+
+```bash
+openssl rand -base64 756 | tr -d '\n'
+```
+
+出力された 1 行の文字列だけを `mongoDbReplicaSetKey` に貼り付けます。末尾に改行がないため、直後に表示されるプロンプトや `%` はコピーしません。キーは安全に保管し、GitHub に push しないでください。再デプロイ時は生成し直さず、保存済みの同じキーを使います。
+
+> [!IMPORTANT]
+> `mongoDbAppPassword` は、Step 9 の `post-deployment-setup.local.sh` に設定する `<YOUR_MONGODB_APP_PASSWORD>` と **1 文字も違わず一致**させます。不一致の場合、Bicep が作成する App VM の `MONGODB_URI` と MongoDB 上のユーザー password がずれ、Backend API が DB に接続できません。
+>
+> この教材では、Bicep が `mongoDbAppPassword` を URL エンコードせずにそのまま MongoDB 接続文字列（`MONGODB_URI`）へ埋め込み、App VM の `/opt/blogapp/.env` や `/etc/environment` に出力します。また、Step 9 の post-deployment script でも SSH 経由の `mongosh` コマンドに埋め込んで実行します。そのため、**`@` や `#` をはじめとする次の文字は `mongoDbAppPassword`（および `ADMIN_PASSWORD`）に使わないでください。**
+>
+> - **`@`**: MongoDB 接続文字列でユーザー情報とホスト名の区切りとして予約されており、`MONGODB_URI` の解釈が壊れます。
+> - **`#`**: URI のフラグメント区切りとして扱われるほか、`.env` ファイル（`dotenv`）や `/etc/environment` で `#` 以降がコメントとして切り捨てられるため、接続文字列が途中で切れて接続に失敗します。
+> - **その他の URI 予約文字・エンコード文字（`:`、`/`、`?`、`%`、`[`、`]`）**: 接続文字列の区切り（コロン、パス、クエリ等）やパーセントエンコードとして解釈され、`MONGODB_URI` のパースエラーや認証失敗の原因になります。
+> - **シェル・`.env`・スクリプトで特別な意味を持つ文字（空白、シングルクォート `'`、ダブルクォート `"`、バッククォート `` ` ``、`$`、`\`、`<`、`>`）**: VM プロビジョニング時や post-deployment script 実行時の変数展開・クォート崩れ・未置換プレースホルダ判定を引き起こします。
+>
+> 迷った場合は、**英数字（`A-Z`、`a-z`、`0-9`）と `!`、`-`、`_`、`.` の範囲**で作成するか、`openssl rand -hex 16` のように 16 進文字列を生成して使用してください。
+>
+> `mongoDbReplicaSetKey` は 3 台の DB VM が互いを認証するための共有キーです（Issue #36）。MongoDB は keyFile と `authorization: enabled` で起動し、ユーザー名とパスワードなしでは読み書きできません。キーは CustomScript の `protectedSettings`（暗号化）で渡されるため、ポータルや `az vm extension show` には表示されません。
+
+複数グループの場合は `groupId` も設定します。
+
+```bicep
+param groupId = 'A'
+```
+
+**期待結果:** 個人値入りの `main.local.bicepparam` を作成できます。
+
+**チェックポイント:** `main.local.bicepparam` は `.gitignore` 対象です。GitHub に push しません。
+
+## 5. リソースグループを作成する
+
+```bash
+cd ~/Azure-IaaS-Workshop
+
+az group create \
+  --name "$RESOURCE_GROUP" \
+  --location "$LOCATION"
+```
+
+**期待結果:** リソースグループが作成されます。
+
+## 6. Bicep デプロイを実行する
+
+```bash
+az deployment group create \
+  --resource-group "$RESOURCE_GROUP" \
+  --template-file materials/bicep/main.bicep \
+  --parameters materials/bicep/main.local.bicepparam
+```
+
+デプロイには 15-30 分かかることがあります。Application Gateway などは作成に時間がかかります。
+
+**期待結果:** コマンドの最終出力に `"provisioningState": "Succeeded"` が表示されます。
+
+**チェックポイント:** 10 分以上動いていないように見えてもすぐにキャンセルしません。Azure Portal でも進捗を確認します。
+
+## 7. Portal でデプロイ進捗を確認する
+
+1. Azure Portal > Resource groups を開きます。
+2. 自身のリソースグループを開きます。
+3. 左メニューのデプロイを開きます。
+4. `main` または実行中の deployment を確認します。
+
+![Azure Portal の該当のリソースグループのデプロイからも進捗を確認できる](../assets/screenshots/learners-portal/day1/deployment.png)
+*Azure Portal の該当のリソースグループのデプロイからも進捗を確認できる*
+
+## 8. Azure CLI の Bastion extension を準備する
+
+デプロイ後セットアップとアプリケーション配置では `az network bastion ssh` を使います。Cloud Shell に Bastion extension が入っていない場合、セットアップスクリプトの SSH 実行で停止するため、ここで先に準備します。
+
+```bash
+az config set extension.use_dynamic_install=yes_without_prompt
+az extension add --name bastion --upgrade --yes
+az extension show --name bastion --query "{name:name,version:version}" -o table
+```
+
+**期待結果:** `bastion` extension の name と version が表示されます。
+
+**チェックポイント:** `az network bastion ssh -h` を実行して help が表示されれば、以後の Bastion 経由 SSH コマンドを実行できます。
+
+## 9. デプロイ後セットアップを実行する
+
+MongoDB レプリカセット初期化とユーザー作成を行います。
+
+```bash
+cd ~/Azure-IaaS-Workshop/scripts
+cp post-deployment-setup.template.sh post-deployment-setup.local.sh
+chmod +x post-deployment-setup.local.sh
+code post-deployment-setup.local.sh
+```
+
+置き換える主な値:
+
+| プレースホルダ | 入力例 |
+|---|---|
+| `<YOUR_RESOURCE_GROUP>` | `$RESOURCE_GROUP` の値 |
+| `<YOUR_BASTION_NAME>` | `bastion-blogapp-prod` |
+| `<PATH_TO_YOUR_SSH_KEY>` | `/home/<cloud-shell-user>/.ssh/id_rsa` または `~/.ssh/id_rsa` |
+| `<YOUR_MONGODB_ADMIN_PASSWORD>` | 自分で決める管理者パスワード |
+| `<YOUR_MONGODB_APP_PASSWORD>` | Step 4 の `mongoDbAppPassword` と同じ値 |
+
+> [!IMPORTANT]
+> SSH 秘密鍵にパスフレーズを設定している場合は、実行前に ssh-agent に鍵を読み込みます。読み込まずに実行すると、スクリプトは最初に `passphrase-protected` のエラーで停止します（Bastion SSH はパスフレーズを毎回は聞き返せないため）。
+>
+> ```bash
+> eval "$(ssh-agent -s)" && ssh-add ~/.ssh/id_rsa
+> ```
+
+実行します。
+
+```bash
+./post-deployment-setup.local.sh "$RESOURCE_GROUP"
+```
+
+**期待結果:** 3 メンバーの MongoDB レプリカセットとユーザーの作成が成功し、Step 6 の検証で `PRIMARY` 1 つと `SECONDARY` 2 つが表示されます。スクリプトは再実行しても安全です（初期化済みのレプリカセットを再初期化しません）。いずれかの手順が失敗すると、スクリプトは `[ERROR]` で原因と対処を表示し、0 以外の終了コードで止まります。表示された対処を行ってから再実行します。出力中の MongoDB 接続文字列のパスワードは `***` でマスクされます。
+
+**チェックポイント:** `MONGODB_APP_PASSWORD` と `mongoDbAppPassword` が一致しない場合、バックエンド API は MongoDB に接続できません。`@` や `#` など接続文字列や `.env` を壊す文字（Step 4 参照）を含む password も使わないでください。
+
+Step 2 が成功しても Step 3 が `Replica set state ...: unknown` で停止する場合は、[トラブルシューティングランブック 7.4](../operations/troubleshooting-runbook.ja.md#74-db-セットアップの-step-3-が-rsstate-を取得できない-issue-58) に従い、ローカルスクリプトの SSH オプションを `-t` から `-T` に変更します。
+
+### 9.1 DB VM の準備完了を確認する
+
+MongoDB 8.0 は Linux カーネル 6.19 以上では起動しません。そのため DB VM では、ローリングの `linux-azure` カーネル（7.0）ではなく、Ubuntu 24.04 の長期 Azure カーネル `linux-azure-lts-24.04`（6.8.x）を使います。新しい DB VM の処理は次の順に進みます。
+
+1. まずイメージのローリングカーネルで起動する
+2. CustomScript が MongoDB をインストールし、GRUB を 6.8 に切り替える
+3. **デプロイ手順の完了から約 1 分後に VM を 1 回再起動する**
+4. 再起動後に mongod が起動する
+
+デプロイ後スクリプトの Step 2 はこの完了を自動で待ちます（DB VM ごとに最大 15 分）。
+
+手動で確認する場合は、`vm-db-az1-prod`、`vm-db-az2-prod`、`vm-db-az3-prod` に順に接続します。
+
+```bash
+az network bastion ssh \
+  --name bastion-blogapp-prod \
+  --resource-group "$RESOURCE_GROUP" \
+  --target-resource-id "$(az vm show -g "$RESOURCE_GROUP" -n vm-db-az1-prod --query id -o tsv)" \
+  --auth-type ssh-key \
+  --username azureuser \
+  --ssh-key ~/.ssh/id_rsa
+```
+
+```bash
+uname -r                                   # 6.8.0-xxxx-azure
+sudo systemctl status mongod --no-pager    # active (running)
+sudo ss -lntp '( sport = :27017 )'         # mongod が待ち受けている
+mongosh --quiet --eval 'db.hello()'        # ok: 1（Step 3 の後は setName blogapp-rs0）。db.hello() は認証不要
+sudo blogapp-kernel-track status           # running kernel ... OK (6.8 LTS track)
+```
+
+**チェックポイント:** `uname -r` が 6.19 以上（例: `7.0.x`）の場合や、mongod が `failed` の場合は、[トラブルシューティングランブック 7.1](../operations/troubleshooting-runbook.ja.md#71-mongodb-が起動しない-linux-カーネル-619-以上-issue-26) を確認します。
+
+### 9.2 レプリカセットが 3 メンバーであることを確認する
+
+DB tier は 3 台のデータ保持メンバー（Primary 1 台 + Secondary 2 台、アービターなし）で構成します（Issue #30）。`vm-db-az1-prod` に接続して次を実行します。MongoDB は認証が有効なため（Issue #36）、管理ユーザー `blogadmin` でログインします。`-p` に値を付けないとパスワードを聞かれるので、Step 9 の `<YOUR_MONGODB_ADMIN_PASSWORD>` を入力します（コマンド履歴に残りません）。
+
+```bash
+mongosh -u blogadmin -p --authenticationDatabase admin --quiet --eval '
+  rs.status().members.forEach(m => print(m.name, m.stateStr, "health=" + m.health));
+  rs.conf().members.forEach(m => print(m.host, "priority=" + m.priority, "votes=" + m.votes))'
+```
+
+**期待結果:**
+
+```text
+10.0.3.4:27017 PRIMARY health=1
+10.0.3.5:27017 SECONDARY health=1
+10.0.3.6:27017 SECONDARY health=1
+10.0.3.4:27017 priority=2 votes=1
+10.0.3.5:27017 priority=1 votes=1
+10.0.3.6:27017 priority=1 votes=1
+```
+
+**チェックポイント:** メンバーが 2 つしかない場合は、2 台構成の旧環境です。[トラブルシューティングランブック 7.2](../operations/troubleshooting-runbook.ja.md#72-既存の-2-ノード環境を-3-ノードへ移行する-issue-30) の手順で 3 台目を追加します。`10.0.3.4` の priority 2 は、最初の Primary を決めて手順を分かりやすくするためだけの設定です。どのメンバーも Primary に選出されます。
+
+続けて、認証なしでは読み取れないことを確認します（Issue #36）。
+
+```bash
+mongosh --quiet --eval 'db.getSiblingDB("blogapp").posts.findOne()'
+```
+
+**期待結果:** `MongoServerError: Command find requires authentication` のように拒否されます。データが表示された場合はアクセス制御が無効です。[トラブルシューティングランブック 7.3](../operations/troubleshooting-runbook.ja.md#73-既存環境で-mongodb-のアクセス制御を有効にする-issue-36) を確認します。
+
+## 10. Data Collection Rule を構成する
+
+Log Analytics のテーブル初期化後に DCR を作成します。
+
+```bash
+cd ~/Azure-IaaS-Workshop
+chmod +x scripts/configure-dcr.sh
+./scripts/configure-dcr.sh "$RESOURCE_GROUP"
+```
+
+**期待結果:** Syslog と Perf の収集用 DCR が作成され、VM に関連付けられます。
+
+**チェックポイント:** 新しい Log Analytics workspace ではテーブル初期化に 1-5 分かかることがあります。タイムアウトした場合は数分待って再実行します。
+
+## 11. Application Gateway の FQDN を取得する
+
+```bash
+FQDN=$(az network public-ip show \
+  --resource-group "$RESOURCE_GROUP" \
+  --name pip-agw-blogapp-prod \
+  --query dnsSettings.fqdn -o tsv)
+
+echo "https://$FQDN"
+```
+
+**期待結果:** `https://<dns-label>.<region>.cloudapp.azure.com` 形式の URL が表示されます。
+
+## 12. フロントエンド SPA のリダイレクト URI を更新する
+
+Azure Portal でフロントエンド SPA のアプリ登録を開きます。
+
+1. Microsoft Entra ID > App registrations > `BlogApp Frontend <自分またはチーム名>` を開きます。
+2. Authentication を開きます。
+3. Single-page application の Redirect URIs に次を追加します。
+   - `https://<YOUR_FQDN>`
+   - `https://<YOUR_FQDN>/`
+4. 保存します。
+
+**期待結果:** 本番 URL で MSAL のリダイレクトが許可されます。
+
+**チェックポイント:** `http://localhost:5173` はローカル開発用として残して構いません。Day 1 の本線では `https://<YOUR_FQDN>` を追加します。
+
+## よくある失敗と確認先
+
+| 症状 | 確認すること | 参照先 |
+|---|---|---|
+| VM SKU が利用できない | `az vm list-skus --location japanwest --size Standard_D2s_v6 --zone -o table` と `az vm list-skus --location japanwest --size Standard_D4s_v6 --zone -o table` | `main.local.bicepparam` の VM size とゾーンのキャパシティ |
+| DB VM の CustomScript が失敗する | VM 拡張のログで `LUN 0` と `/dev/disk/azure/data/by-lun/0` を確認 | 既存 VM は削除せず、修正後に `skipVmCreationDb=true` と新しい `forceUpdateTagDb` で拡張を再実行（[再デプロイ手順](../reference/bicep-techniques-guide.ja.md#53-forceupdatetag-で-custom-script-を再実行する)） |
+| DNS label が重複する | `appGatewayDnsLabel` がリージョン内で一意か | Step 4 |
+| Deployment が失敗する | Portal の Deployments の失敗リソースと error details | Step 7 |
+| MongoDB 接続に失敗する | `mongoDbAppPassword` と post-deployment script の値が一致しているか、`@` や `#` などの使用不可文字を含まない password か | Step 4、Step 9 |
+| post-deployment の Step 2 がタイムアウトする / API が `ECONNREFUSED` `ReplicaSetNoPrimary` になる | DB VM のカーネルが 6.8.x で mongod が active か | Step 9.1、[ランブック 7.1](../operations/troubleshooting-runbook.ja.md#71-mongodb-が起動しない-linux-カーネル-619-以上-issue-26) |
+| `az network bastion ssh` が見つからない | Bastion extension が Cloud Shell に入っているか | Step 8 |
+| Cloud Shell 再起動後に SSH できない | `~/.ssh/id_rsa` と環境変数を復旧したか | トラブルシューティングランブック |
+| Log Analytics にデータがない | DCR 作成、VM 関連付け、数分の待機 | Step 10、監視ガイド |
+
+## Day 1 Azure リソースデプロイ完了条件
+
+- Cloud Shell 上にリポジトリを clone できた。
+- SSH 鍵と SSL 証明書を作成できた。
+- `main.local.bicepparam` を作成し、必要値を設定できた。
+- Bicep deployment が `Succeeded` になった。
+- Azure CLI の Bastion extension を準備できた。
+- 3 台の DB VM が 6.8.x カーネルで起動し、mongod が active になっている。
+- `rs.status()` で 3 メンバー（`PRIMARY` 1 つ + `SECONDARY` 2 つ）を確認できた。
+- デプロイ後セットアップが完了した。
+- Data Collection Rule を構成できた。
+- Application Gateway の FQDN を取得できた。
+- フロントエンド SPA の本番リダイレクト URI を追加できた。
+
+## 次に進む
+
+[Day 1: アプリデプロイ](day-1-app-deployment.ja.md) に進みます。
+
+前のページ: [Day 0: 事前準備](day-0-prerequisites.ja.md)
+迷ったとき: [受講者ポータル](../index.md) / [トラブルシューティングランブック](../operations/troubleshooting-runbook.ja.md) / [クイックリファレンス](../reference/quick-reference-card.ja.md)

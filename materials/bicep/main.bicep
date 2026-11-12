@@ -1,0 +1,660 @@
+// =============================================================================
+// Main Bicep Template - Azure IaaS Workshop Infrastructure
+// =============================================================================
+// Purpose: Orchestrate deployment of all infrastructure components
+// Reference: /design/AzureArchitectureDesign.md
+//
+// Deployment Order (managed by Bicep dependency resolution):
+//   1. Monitoring (Log Analytics, Data Collection Rule)
+//   2. Security (Key Vault - after all VMs)
+//   3. Storage (Storage Account)
+//   4. Network (NSGs → NAT Gateway → VNet → Bastion, Load Balancer)
+//   5. Compute (Web tier → App tier → DB tier)
+//   Note: DB tier explicitly depends on VNet to ensure NAT Gateway is attached
+//
+// Usage:
+//   az deployment group create \
+//     --resource-group rg-blogapp-prod \
+//     --template-file main.bicep \
+//     --parameters main.bicepparam
+//
+// Estimated Deployment Time: 15-30 minutes
+// Estimate Japan West Dsv6 costs with the Azure Pricing Calculator before deployment.
+// =============================================================================
+
+// =============================================================================
+// Target Scope
+// =============================================================================
+targetScope = 'resourceGroup'
+
+// =============================================================================
+// Parameters
+// =============================================================================
+
+@description('Azure region for all resources')
+param location string = resourceGroup().location
+
+@description('Environment name (prod, dev, test)')
+@allowed(['prod', 'dev', 'test'])
+param environment string = 'prod'
+
+@description('Workload name for naming convention')
+param workloadName string = 'blogapp'
+
+// =============================================================================
+// Multi-Group Workshop Support
+// =============================================================================
+// For workshops with multiple groups (A-J) deploying to the same subscription,
+// each group should use a unique resource group name.
+// The groupId is used to generate a recommended resource group name.
+// Example: Group A → rg-blogapp-A-workshop
+// =============================================================================
+
+@description('Workshop group identifier (A-J) for multi-group deployments. Leave empty for single-group.')
+@allowed(['', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'])
+param groupId string = ''
+
+@description('Admin username for all VMs')
+param adminUsername string = 'azureuser'
+
+@description('SSH public key for VM authentication')
+@secure()
+param sshPublicKey string
+
+@description('Object ID of the admin user for Key Vault access')
+param adminObjectId string
+
+@description('Deploy Azure Bastion (set to false to reduce costs during development)')
+param deployBastion bool = true
+
+@description('Deploy NAT Gateway for DB tier outbound connectivity')
+param deployNatGateway bool = true
+
+@description('Deploy Monitoring resources (Log Analytics, DCR)')
+param deployMonitoring bool = true
+
+@description('Deploy Key Vault for secrets management')
+param deployKeyVault bool = true
+
+// Creating role assignments needs Microsoft.Authorization/roleAssignments/write
+// (Owner, User Access Administrator or Role Based Access Control Administrator).
+// The Contributor role cannot do this, so a Contributor-only learner sets this
+// to false. The app does not read Key Vault at runtime, so nothing breaks.
+// AWS comparison: like an IAM user who may create EC2 instances but has no
+// iam:AttachRolePolicy right, so it cannot grant permissions to the instances.
+@description('Create Key Vault RBAC role assignments (admin + VM managed identities). Set to false when you only have the Contributor role.')
+param assignKeyVaultRoles bool = true
+
+@description('Deploy Storage Account for static assets')
+param deployStorage bool = true
+
+@description('VM size for Web tier')
+param webVmSize string = 'Standard_D2s_v6'
+
+@description('VM size for App tier')
+param appVmSize string = 'Standard_D2s_v6'
+
+@description('VM size for DB tier')
+param dbVmSize string = 'Standard_D4s_v6'
+
+@description('MongoDB data disk size in GB')
+param dbDataDiskSizeGB int = 128
+
+// Issue #35: exposed so learners can work around regions/SKUs without Zone 3.
+@description('Availability Zone for the 3rd DB VM (vm-db-az3). Keep \'3\' so each replica set member is in its own zone. Use \'1\' or \'2\' only when Standard_D4s_v6 is not offered in Zone 3: automatic failover still survives any single VM failure, but an outage of the zone that hosts 2 members loses the majority (no PRIMARY, writes stop).')
+@allowed(['1', '2', '3'])
+param dbVmAz3Zone string = '3'
+
+@description('Tags to apply to all resources')
+param tags object = {}
+
+// =============================================================================
+// Force Update Tags (CustomScript Re-execution Control)
+// =============================================================================
+// Change these values to force CustomScript extensions to re-run on specific tiers.
+// Use timestamp or version string. Empty string = no forced re-run.
+// Example: forceUpdateTagWeb='20251217120000' to update only Web tier NGINX config
+// =============================================================================
+
+@description('Force update tag for Web tier - changes force NGINX script to re-run')
+param forceUpdateTagWeb string = ''
+
+@description('Force update tag for App tier - changes force Node.js script to re-run')
+param forceUpdateTagApp string = ''
+
+@description('Force update tag for DB tier - changes force MongoDB script to re-run (rarely needed)')
+param forceUpdateTagDb string = ''
+
+// =============================================================================
+// Skip VM Creation (Extension-Only Updates)
+// =============================================================================
+// Set to true when VMs already exist and you only want to update extensions.
+// This avoids the "Changing SSH keys not allowed" error on re-deployment.
+// =============================================================================
+
+@description('Skip Web tier VM creation - only update extensions on existing VMs')
+param skipVmCreationWeb bool = false
+
+@description('Skip App tier VM creation - only update extensions on existing VMs')
+param skipVmCreationApp bool = false
+
+@description('Skip DB tier VM creation - only update extensions on existing VMs')
+param skipVmCreationDb bool = false
+
+@description('Skip creation of the 3rd DB VM (vm-db-az3) only. Defaults to skipVmCreationDb. Set false with skipVmCreationDb=true to add the 3rd member to an existing 2-node environment (Issue #30).')
+param skipVmCreationDbAz3 bool = skipVmCreationDb
+
+// =============================================================================
+// Microsoft Entra ID Parameters (Authentication Configuration)
+// =============================================================================
+// These are injected into VMs by CustomScript Extension:
+// - App tier: Environment variables for backend authentication
+// - Web tier: /config.json for frontend runtime configuration
+// Reference: /design/AzureArchitectureDesign.md - Bicep Parameter Flow
+// =============================================================================
+
+@description('Microsoft Entra tenant ID for authentication')
+param entraTenantId string
+
+@description('Microsoft Entra client ID for backend API (registered app)')
+param entraClientId string
+
+@description('Microsoft Entra client ID for frontend SPA (registered app)')
+param entraFrontendClientId string
+
+// =============================================================================
+// Application Gateway SSL Certificate Parameters
+// =============================================================================
+// For workshop: Self-signed certificate enables HTTPS without custom domain/CA
+// Students generate certificate using provided script and encode as base64
+// Browser will show certificate warning (expected - students click "Proceed")
+// =============================================================================
+
+@description('Self-signed SSL certificate in PFX format (base64 encoded). Leave empty to use HTTP only.')
+@secure()
+param sslCertificateData string = ''
+
+@description('Password for the PFX certificate. Required if sslCertificateData is provided.')
+@secure()
+param sslCertificatePassword string = ''
+
+@description('DNS label for Application Gateway public IP (creates <label>.<region>.cloudapp.azure.com)')
+param appGatewayDnsLabel string = ''
+
+// =============================================================================
+// MongoDB Application Password
+// =============================================================================
+// IMPORTANT: This password is used in the Backend API connection string.
+// You must use the SAME password when running the post-deployment setup script.
+// Reference: Issue #1 - Password synchronization between Bicep and scripts
+// =============================================================================
+
+@description('Password for MongoDB application user (blogapp). Must match the password used in post-deployment-setup script.')
+@secure()
+param mongoDbAppPassword string
+
+// Issue #36: MongoDB access control. Every DB VM gets the same key in
+// /etc/mongodb/keyfile (replica set members authenticate each other with it),
+// and mongod runs with authorization enabled. The key travels only in the
+// CustomScript protectedSettings (encrypted).
+@description('Shared MongoDB replica set key (internal authentication between the 3 DB VMs). 6-1024 base64 characters. Generate with: openssl rand -base64 756 | tr -d \'\\n\'. Keep the same value on every redeployment.')
+@secure()
+param mongoDbReplicaSetKey string  // Length (6-1024) is validated by modules/compute/db-tier.bicep
+
+// =============================================================================
+// Variables
+// =============================================================================
+var defaultTags = {
+  Environment: environment
+  Workload: workloadName
+  Owner: 'Workshop'
+  CostCenter: 'Training'
+  ManagedBy: 'Bicep'
+}
+var allTags = union(defaultTags, tags)
+
+// Subnet CIDRs
+var vnetAddressPrefix = '10.0.0.0/16'
+var appGatewaySubnetPrefix = '10.0.0.0/24'
+var webSubnetPrefix = '10.0.1.0/24'
+var appSubnetPrefix = '10.0.2.0/24'
+var dbSubnetPrefix = '10.0.3.0/24'
+var bastionSubnetPrefix = '10.0.255.0/26'
+
+// DB tier static private IPs (Issue #30: 3-member MongoDB replica set)
+// Single source of truth for the DB VMs AND the App tier connection string.
+// Azure reserves .0-.3 in every subnet, so .4/.5/.6 are the first usable IPs.
+// One member per Availability Zone: az1=.4, az2=.5, az3=.6
+var dbVmPrivateIps = [
+  '10.0.3.4'
+  '10.0.3.5'
+  '10.0.3.6'
+]
+var mongoDbHosts = join(map(dbVmPrivateIps, ip => '${ip}:27017'), ',')
+
+// =============================================================================
+// Module 1: Monitoring (Log Analytics + Data Collection Rule)
+// =============================================================================
+// Deploy first - VMs need this for Azure Monitor Agent
+// =============================================================================
+
+module logAnalytics 'modules/monitoring/log-analytics.bicep' = if (deployMonitoring) {
+  name: 'deploy-log-analytics'
+  params: {
+    location: location
+    environment: environment
+    workloadName: workloadName
+    retentionInDays: 30
+    tags: allTags
+  }
+}
+
+// =============================================================================
+// NOTE: Data Collection Rule (DCR) is NOT deployed via Bicep
+// =============================================================================
+// DCR deployment requires Log Analytics tables (Syslog, Perf) to exist, but
+// these tables are created asynchronously and may not be ready at deployment time.
+//
+// Solution: Create DCR post-deployment using Azure CLI/PowerShell
+//   - macOS/Linux: ./scripts/configure-dcr.sh <resource-group>
+//   - Windows: .\scripts\configure-dcr.ps1 -ResourceGroupName <resource-group>
+//
+// The script waits for tables to initialize, then creates the full DCR with:
+//   - Syslog collection (auth, daemon, syslog facilities)
+//   - Performance counters (CPU, Memory, Disk, Network)
+// =============================================================================
+
+// =============================================================================
+// Module 2: Network Security Groups
+// =============================================================================
+// Deploy before VNet (VNet references NSG IDs)
+// =============================================================================
+
+module nsgWeb 'modules/network/nsg-web.bicep' = {
+  name: 'deploy-nsg-web'
+  params: {
+    location: location
+    environment: environment
+    workloadName: workloadName
+    bastionSubnetPrefix: bastionSubnetPrefix
+    appGatewaySubnetPrefix: appGatewaySubnetPrefix
+    tags: allTags
+  }
+}
+
+module nsgApp 'modules/network/nsg-app.bicep' = {
+  name: 'deploy-nsg-app'
+  params: {
+    location: location
+    environment: environment
+    workloadName: workloadName
+    webSubnetPrefix: webSubnetPrefix
+    dbSubnetPrefix: dbSubnetPrefix
+    bastionSubnetPrefix: bastionSubnetPrefix
+    tags: allTags
+  }
+}
+
+module nsgDb 'modules/network/nsg-db.bicep' = {
+  name: 'deploy-nsg-db'
+  params: {
+    location: location
+    environment: environment
+    workloadName: workloadName
+    appSubnetPrefix: appSubnetPrefix
+    dbSubnetPrefix: dbSubnetPrefix
+    bastionSubnetPrefix: bastionSubnetPrefix
+    tags: allTags
+  }
+}
+
+// =============================================================================
+// Module 2b: NAT Gateway (for DB Tier outbound connectivity)
+// =============================================================================
+// NAT Gateway v2 provides zone-redundant outbound internet access
+// Required for: MongoDB installation, package updates, Azure Monitor
+// =============================================================================
+
+module natGateway 'modules/network/nat-gateway.bicep' = if (deployNatGateway) {
+  name: 'deploy-nat-gateway'
+  params: {
+    location: location
+    environment: environment
+    workloadName: workloadName
+    idleTimeoutInMinutes: 10
+    tags: allTags
+  }
+}
+
+// =============================================================================
+// Module 3: Virtual Network
+// =============================================================================
+// VNet with 4 subnets, NSGs attached
+// NAT Gateway attached to DB subnet for outbound connectivity
+// =============================================================================
+
+module vnet 'modules/network/vnet.bicep' = {
+  name: 'deploy-vnet'
+  // Explicit dependency: VNet must wait for NAT Gateway to be fully deployed
+  // before creating subnets with NAT Gateway association
+  dependsOn: [
+    natGateway
+  ]
+  params: {
+    location: location
+    environment: environment
+    workloadName: workloadName
+    vnetAddressPrefix: vnetAddressPrefix
+    appGatewaySubnetPrefix: appGatewaySubnetPrefix
+    webSubnetPrefix: webSubnetPrefix
+    appSubnetPrefix: appSubnetPrefix
+    dbSubnetPrefix: dbSubnetPrefix
+    bastionSubnetPrefix: bastionSubnetPrefix
+    webNsgId: nsgWeb.outputs.nsgId
+    appNsgId: nsgApp.outputs.nsgId
+    dbNsgId: nsgDb.outputs.nsgId
+    appNatGatewayId: natGateway.?outputs.?natGatewayId ?? ''
+    dbNatGatewayId: natGateway.?outputs.?natGatewayId ?? ''
+    tags: allTags
+  }
+}
+
+// =============================================================================
+// Module 4: Azure Bastion
+// =============================================================================
+// Secure SSH access without public IPs on VMs
+// Standard SKU enables native client support (SSH from local terminal)
+// =============================================================================
+
+module bastion 'modules/network/bastion.bicep' = if (deployBastion) {
+  name: 'deploy-bastion'
+  params: {
+    location: location
+    environment: environment
+    workloadName: workloadName
+    bastionSubnetId: vnet.outputs.bastionSubnetId
+    bastionSku: 'Standard'  // Standard enables native client, file copy, IP connect
+    tags: allTags
+  }
+}
+
+// =============================================================================
+// Module 5: Application Gateway (Web Tier - External)
+// =============================================================================
+// Application Gateway v2 for Web tier (public-facing with SSL/TLS termination)
+// Provides Layer 7 load balancing with HTTPS support via self-signed certificate
+// =============================================================================
+
+module applicationGateway 'modules/network/application-gateway.bicep' = {
+  name: 'deploy-application-gateway'
+  params: {
+    location: location
+    environment: environment
+    workloadName: workloadName
+    tags: allTags
+    subnetId: vnet.outputs.appGatewaySubnetId
+    webTierPrivateIps: webTier.outputs.privateIpAddresses
+    sslCertificateData: sslCertificateData
+    sslCertificatePassword: sslCertificatePassword
+    dnsLabel: appGatewayDnsLabel
+  }
+}
+
+// =============================================================================
+// Module 5b: Internal Load Balancer (App Tier)
+// =============================================================================
+// Internal Load Balancer for App tier
+// Prepares architecture for future VMSS auto-scaling migration
+// NGINX (Web tier) → ILB → App tier VMs
+// =============================================================================
+
+module internalLoadBalancer 'modules/network/internal-load-balancer.bicep' = {
+  name: 'deploy-internal-load-balancer'
+  params: {
+    location: location
+    environment: environment
+    workloadName: workloadName
+    subnetId: vnet.outputs.appSubnetId
+    frontendPrivateIp: '10.0.2.10'  // Static IP within App subnet
+    tags: allTags
+  }
+}
+
+// =============================================================================
+// Module 6: Key Vault
+// =============================================================================
+// Key Vault is now deployed AFTER all VMs (see Module 11)
+// This ensures VM principal IDs are available for role assignments
+// =============================================================================
+
+// =============================================================================
+// Module 7: Storage Account
+// =============================================================================
+// Blob storage for static assets
+// =============================================================================
+
+module storageAccount 'modules/storage/storage-account.bicep' = if (deployStorage) {
+  name: 'deploy-storage'
+  params: {
+    location: location
+    environment: environment
+    workloadName: workloadName
+    storageSku: 'Standard_LRS'
+    enableVersioning: false
+    enableBlobSoftDelete: true
+    tags: allTags
+  }
+}
+
+// =============================================================================
+// Module 8: Web Tier VMs
+// =============================================================================
+// 2 NGINX VMs across Availability Zones
+// Application Gateway manages backend pool using VM private IPs
+// =============================================================================
+
+module webTier 'modules/compute/web-tier.bicep' = {
+  name: 'deploy-web-tier'
+  params: {
+    location: location
+    environment: environment
+    workloadName: workloadName
+    subnetId: vnet.outputs.webSubnetId
+    // Note: Application Gateway uses VM private IPs directly (no backendPoolId needed)
+    adminUsername: adminUsername
+    sshPublicKey: sshPublicKey
+    vmSize: webVmSize
+    enableMonitoring: deployMonitoring
+    logAnalyticsWorkspaceId: logAnalytics.?outputs.?workspaceId ?? ''  // Safe-dereference for conditional module
+    dataCollectionRuleId: ''  // DCR created post-deployment via scripts/configure-dcr.sh
+    entraTenantId: entraTenantId
+    entraClientId: entraClientId
+    entraFrontendClientId: entraFrontendClientId
+    forceUpdateTag: forceUpdateTagWeb
+    skipVmCreation: skipVmCreationWeb
+    tags: allTags
+  }
+}
+
+// =============================================================================
+// Module 9: App Tier VMs
+// =============================================================================
+// 2 Express/Node.js VMs across Availability Zones
+// Connected to Internal Load Balancer (VMSS-ready architecture)
+// =============================================================================
+
+module appTier 'modules/compute/app-tier.bicep' = {
+  name: 'deploy-app-tier'
+  params: {
+    location: location
+    environment: environment
+    workloadName: workloadName
+    subnetId: vnet.outputs.appSubnetId
+    loadBalancerBackendPoolId: internalLoadBalancer.outputs.backendPoolId  // Internal LB
+    adminUsername: adminUsername
+    sshPublicKey: sshPublicKey
+    vmSize: appVmSize
+    enableMonitoring: deployMonitoring
+    logAnalyticsWorkspaceId: logAnalytics.?outputs.?workspaceId ?? ''  // Safe-dereference for conditional module
+    dataCollectionRuleId: ''  // DCR created post-deployment via scripts/configure-dcr.sh
+    entraTenantId: entraTenantId
+    entraClientId: entraClientId
+    mongoDbAppPassword: mongoDbAppPassword  // Issue #1: Synchronized password
+    mongoDbHosts: mongoDbHosts  // Issue #30: all 3 replica set members as seeds
+    forceUpdateTag: forceUpdateTagApp
+    skipVmCreation: skipVmCreationApp
+    tags: allTags
+  }
+}
+
+// =============================================================================
+// Module 10: DB Tier VMs
+// =============================================================================
+// 3 MongoDB VMs across Availability Zones 1/2/3 (Issue #30)
+// All 3 are data-bearing voting members (no arbiter), so any single VM or zone
+// failure leaves a majority (2 of 3) for automatic election and w:majority.
+// Requires a region/SKU with 3 zones; see db-tier.bicep "Zone requirement".
+// =============================================================================
+
+module dbTier 'modules/compute/db-tier.bicep' = {
+  name: 'deploy-db-tier'
+  // Explicit dependency: DB VMs require internet access during provisioning
+  // to download MongoDB packages. NAT Gateway must be attached to DB subnet first.
+  // The vnet module already depends on natGateway, so this ensures:
+  // NAT Gateway → VNet (with NAT Gateway attached to subnets) → DB VMs
+  dependsOn: [
+    vnet  // Ensures NAT Gateway is attached to DB subnet before VM provisioning
+  ]
+  params: {
+    location: location
+    environment: environment
+    workloadName: workloadName
+    subnetId: vnet.outputs.dbSubnetId
+    adminUsername: adminUsername
+    sshPublicKey: sshPublicKey
+    mongoDbReplicaSetKey: mongoDbReplicaSetKey  // Issue #36: keyFile, sent via protectedSettings
+    vmSize: dbVmSize
+    dataDiskSizeGB: dbDataDiskSizeGB
+    enableMonitoring: deployMonitoring
+    logAnalyticsWorkspaceId: logAnalytics.?outputs.?workspaceId ?? ''  // Safe-dereference for conditional module
+    dataCollectionRuleId: ''  // DCR created post-deployment via scripts/configure-dcr.sh
+    forceUpdateTag: forceUpdateTagDb
+    skipVmCreation: skipVmCreationDb
+    skipVmCreationAz3: skipVmCreationDbAz3
+    dbVmAz1PrivateIp: dbVmPrivateIps[0]
+    dbVmAz2PrivateIp: dbVmPrivateIps[1]
+    dbVmAz3PrivateIp: dbVmPrivateIps[2]
+    dbVmAz3Zone: dbVmAz3Zone
+    tags: allTags
+  }
+}
+
+// =============================================================================
+// Module 11: Key Vault (deployed after all VMs)
+// =============================================================================
+// Key Vault is deployed AFTER all VMs to ensure:
+// 1. All VM principal IDs are available for role assignments
+// 2. If any VM fails, Key Vault deployment doesn't start (no cascading errors)
+// =============================================================================
+
+module keyVault 'modules/security/key-vault.bicep' = if (deployKeyVault) {
+  name: 'deploy-key-vault'
+  params: {
+    location: location
+    environment: environment
+    workloadName: workloadName
+    adminObjectId: adminObjectId
+    assignRoles: assignKeyVaultRoles
+    // Implicit dependencies: Key Vault waits for all VM tiers to complete
+    // because we reference their outputs (principalIds) below
+    vmPrincipalIds: concat(
+      webTier.outputs.principalIds,
+      appTier.outputs.principalIds,
+      dbTier.outputs.principalIds
+    )
+    enableSoftDelete: environment == 'prod'
+    tags: allTags
+  }
+}
+
+// =============================================================================
+// Outputs
+// =============================================================================
+
+@description('Resource Group name')
+output resourceGroupName string = resourceGroup().name
+
+@description('Application Gateway public IP address')
+output appGatewayPublicIp string = applicationGateway.outputs.publicIpAddress
+
+@description('Application Gateway FQDN')
+output appGatewayFqdn string = applicationGateway.outputs.fqdn
+
+@description('Application Gateway HTTPS URL')
+output appGatewayHttpsUrl string = applicationGateway.outputs.httpsUrl
+
+@description('SSL/TLS enabled status')
+output sslEnabled bool = applicationGateway.outputs.sslEnabled
+
+@description('Internal Load Balancer private IP (App tier)')
+output internalLoadBalancerIp string = internalLoadBalancer.outputs.frontendPrivateIp
+
+@description('Web tier VM private IPs')
+output webTierPrivateIps array = webTier.outputs.privateIpAddresses
+
+@description('App tier VM private IPs')
+output appTierPrivateIps array = appTier.outputs.privateIpAddresses
+
+@description('DB tier VM private IPs')
+output dbTierPrivateIps array = dbTier.outputs.privateIpAddresses
+
+@description('MongoDB connection string')
+output mongoConnectionString string = dbTier.outputs.mongoConnectionString
+
+@description('Log Analytics Workspace ID')
+output logAnalyticsWorkspaceId string = logAnalytics.?outputs.?workspaceId ?? ''
+
+@description('Key Vault URI')
+output keyVaultUri string = keyVault.?outputs.?keyVaultUri ?? ''
+
+@description('Storage Account Blob Endpoint')
+output storageBlobEndpoint string = storageAccount.?outputs.?blobEndpoint ?? ''
+
+@description('Azure Bastion name (for portal access)')
+output bastionName string = bastion.?outputs.?bastionName ?? ''
+
+@description('NAT Gateway Public IP (for outbound connectivity)')
+output natGatewayPublicIp string = natGateway.?outputs.?publicIpAddress ?? ''
+
+@description('Recommended resource group name for multi-group workshops')
+output recommendedResourceGroupName string = empty(groupId) 
+  ? 'rg-${workloadName}-workshop' 
+  : 'rg-${workloadName}-${groupId}-workshop'
+
+// =============================================================================
+// Post-Deployment Instructions
+// =============================================================================
+// After deployment completes, perform these manual steps:
+//
+// 1. Connect to DB VMs via Bastion and initialize MongoDB replica set:
+//    mongosh --eval "rs.initiate({
+//      _id: 'blogapp-rs0',
+//      members: [
+//        { _id: 0, host: '<db-vm-1-ip>:27017', priority: 2 },
+//        { _id: 1, host: '<db-vm-2-ip>:27017', priority: 1 }
+//      ]
+//    })"
+//
+// 2. Update NGINX configuration on Web VMs to use Internal LB:
+//    upstream backend {
+//        server 10.0.2.10:3000;  # Internal LB IP (not individual VM IPs)
+//    }
+//    Note: Using ILB IP prepares for VMSS auto-scaling migration
+//
+// 3. Deploy application code to App and Web VMs
+//
+// 4. Add secrets to Key Vault:
+//    az keyvault secret set --vault-name <keyvault-name> \
+//      --name "MongoDbConnectionString" \
+//      --value "<connection-string>"
+// =============================================================================

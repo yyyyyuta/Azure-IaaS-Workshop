@@ -1,0 +1,187 @@
+#!/bin/bash
+set -e
+
+# ==========================================================
+# Wait for dpkg/apt locks to be released
+# ==========================================================
+# Azure Linux Agent may be running unattended-upgrades on first boot
+# This can hold dpkg lock for 1-5 minutes
+# We wait up to 5 minutes for the lock to be released
+# ==========================================================
+
+wait_for_apt_lock() {
+  local timeout=300
+  local interval=10
+  local elapsed=0
+  
+  echo "Checking for dpkg/apt locks..."
+  
+  while true; do
+    # Check if any apt/dpkg processes are running
+    if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && \
+       ! fuser /var/lib/apt/lists/lock >/dev/null 2>&1 && \
+       ! fuser /var/cache/apt/archives/lock >/dev/null 2>&1; then
+      echo "All apt/dpkg locks are free, proceeding..."
+      return 0
+    fi
+    
+    if [ $elapsed -ge $timeout ]; then
+      echo "ERROR: Timeout waiting for apt/dpkg locks after ${timeout}s"
+      return 1
+    fi
+    
+    echo "apt/dpkg lock is held, waiting ${interval}s... (${elapsed}s elapsed)"
+    sleep $interval
+    elapsed=$((elapsed + interval))
+  done
+}
+
+# Set non-interactive mode to prevent prompts during package installation
+export DEBIAN_FRONTEND=noninteractive
+
+# Execute wait function (initial check to reduce log spam)
+wait_for_apt_lock
+
+# Update packages with lock timeout (backup protection against race conditions)
+# DPkg::Lock::Timeout waits up to 120 seconds if another process holds the lock
+apt-get -o DPkg::Lock::Timeout=120 update
+apt-get -o DPkg::Lock::Timeout=120 -y upgrade
+
+# Install prerequisites
+apt-get -o DPkg::Lock::Timeout=120 -y install ca-certificates curl gnupg
+
+# Add NodeSource repository for Node.js 24 LTS
+mkdir -p /etc/apt/keyrings
+
+# Use --batch flag for non-interactive GPG operation (no TTY available in CustomScript)
+# Check if keyring already exists to make script idempotent (re-runnable)
+if [ ! -f /etc/apt/keyrings/nodesource.gpg ]; then
+  echo "Downloading NodeSource GPG key..."
+  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --batch --dearmor -o /etc/apt/keyrings/nodesource.gpg
+else
+  echo "NodeSource GPG key already exists, skipping download"
+fi
+
+# Add or update repository. Re-running the CustomScript on an existing VM must
+# replace older NodeSource major-version entries.
+NODE_SOURCE_LIST=/etc/apt/sources.list.d/nodesource.list
+NODE_SOURCE_REPO="deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main"
+if [ ! -f "$NODE_SOURCE_LIST" ] || ! grep -q "node_24.x" "$NODE_SOURCE_LIST"; then
+  echo "$NODE_SOURCE_REPO" | tee "$NODE_SOURCE_LIST"
+else
+  echo "NodeSource Node.js 24 repository already configured"
+fi
+
+# Install Node.js 24 LTS
+apt-get -o DPkg::Lock::Timeout=120 update
+apt-get -o DPkg::Lock::Timeout=120 -y install nodejs
+
+# Verify installation
+node --version
+npm --version
+
+# Install PM2 globally (process manager for Node.js)
+npm install -g pm2
+
+# Create application directory
+mkdir -p /opt/blogapp
+chown -R azureuser:azureuser /opt/blogapp
+
+# Create systemd service for PM2
+pm2 startup systemd -u azureuser --hp /home/azureuser
+
+# Create a placeholder health check server
+cat > /opt/blogapp/health-server.js << 'EOF'
+const http = require('http');
+
+const server = http.createServer((req, res) => {
+  if (req.url === '/api/health' || req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'healthy', timestamp: new Date().toISOString() }));
+  } else {
+    res.writeHead(404);
+    res.end('Not Found');
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`Health check server running on port ${PORT}`);
+});
+EOF
+
+# Start health check server with PM2 (temporary until app is deployed)
+# Re-run safety: when this CustomScript re-runs on an existing VM (for example
+# forceUpdateTagApp, or a redeploy that changes MONGODB_URI such as the 3-node
+# MongoDB migration in Issue #30), the real API "blogapp-api" already owns
+# port 3000. Starting the placeholder then would only crash-loop in PM2.
+cd /opt/blogapp
+if sudo -u azureuser pm2 describe blogapp-api >/dev/null 2>&1; then
+  echo "blogapp-api is already managed by PM2, skipping the placeholder health server"
+elif sudo -u azureuser pm2 describe blogapp-health >/dev/null 2>&1; then
+  echo "Placeholder health server already running"
+else
+  sudo -u azureuser pm2 start health-server.js --name blogapp-health
+  sudo -u azureuser pm2 save
+fi
+
+# ==========================================================
+# Inject Production Environment Variables
+# ==========================================================
+# These environment variables are loaded by Node.js process.env
+# /etc/environment makes them available to all users and services
+# Reference: /design/BackendApplicationDesign.md - Environment-Aware Configuration
+# ==========================================================
+
+echo "Configuring production environment variables..."
+
+# Re-run safety: remove the block written by a previous run before appending,
+# so a re-run replaces values (for example the 3-host MONGODB_URI, Issue #30)
+# instead of leaving duplicate keys in /etc/environment.
+sed -i -E \
+  -e '/^(NODE_ENV|PORT|LOG_LEVEL|MONGODB_URI|ENTRA_TENANT_ID|ENTRA_CLIENT_ID)=/d' \
+  -e '/^# =+$/d' \
+  -e '/^# Backend Application Environment Variables$/d' \
+  -e '/^# Injected by Bicep CustomScript Extension$/d' \
+  -e '/^# DO NOT EDIT MANUALLY - regenerated on VM provisioning$/d' \
+  /etc/environment
+
+cat >> /etc/environment << ENVEOF
+# ==========================================================
+# Backend Application Environment Variables
+# Injected by Bicep CustomScript Extension
+# DO NOT EDIT MANUALLY - regenerated on VM provisioning
+# ==========================================================
+NODE_ENV=production
+PORT=3000
+LOG_LEVEL=info
+MONGODB_URI=__MONGODB_URI__
+ENTRA_TENANT_ID=__ENTRA_TENANT_ID__
+ENTRA_CLIENT_ID=__ENTRA_CLIENT_ID__
+ENVEOF
+
+# Make environment variables available immediately for current session
+export NODE_ENV=production
+export PORT=3000
+export LOG_LEVEL=info
+export MONGODB_URI="__MONGODB_URI__"
+export ENTRA_TENANT_ID="__ENTRA_TENANT_ID__"
+export ENTRA_CLIENT_ID="__ENTRA_CLIENT_ID__"
+
+# Also create /opt/blogapp/.env for PM2 and direct Node.js execution
+cat > /opt/blogapp/.env << DOTENVEOF
+# Production environment configuration
+# Injected by Bicep CustomScript Extension
+NODE_ENV=production
+PORT=3000
+LOG_LEVEL=info
+MONGODB_URI=__MONGODB_URI__
+ENTRA_TENANT_ID=__ENTRA_TENANT_ID__
+ENTRA_CLIENT_ID=__ENTRA_CLIENT_ID__
+DOTENVEOF
+
+chown azureuser:azureuser /opt/blogapp/.env
+chmod 600 /opt/blogapp/.env
+
+echo "Environment variables configured successfully"
+echo "Node.js installation completed successfully"
